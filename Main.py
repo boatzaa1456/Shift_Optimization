@@ -30,15 +30,16 @@ START_DATE = date(2025, 1, 1)
 # Groups & Shifts
 NUM_GROUPS = 3
 GROUPS = [chr(ord('A') + i) for i in range(NUM_GROUPS)]   # ['A','B','C','D','E','F']
-SHIFTS = ['M','N']                                   # any set, e.g. ['M','N'] or ['D','A','N']
+SHIFTS = ['M', 'N']                                # any set, e.g. ['M','N'] or ['D','A','N']
 HOLIDAY = 'H'
 
-# Cycle length (try 28 / 33 / 35 / 42 ...)
-CYCLE_LEN = 42
+# Cycle length pattern: keep a repeating weekly/bi-weekly template
+CYCLE_LEN = 14                                     # choose 7 or 14 for realistic repeating pattern
 
 # Hard/soft constraints
 MAX_RUN = 4              # max consecutive SAME shift per group
 MAX_WORK_STREAK = 6      # NEW RULE: max consecutive working days (any shift)
+MIN_REST_DAYS_BETWEEN_SHIFTS = 1  # require at least this many holidays before changing shift type
 
 # GA hyper-parameters
 POP_SIZE = 480
@@ -52,6 +53,7 @@ IMMIGRANTS_FRAC = 0.10       # % random immigrants each generation
 # Objective/penalty weights
 PENALTY_SHIFT_RUN_W = 80.0       # weight for SAME-shift run-length violations
 PENALTY_WORK_STREAK_W = 120.0    # weight for > MAX_WORK_STREAK violations (stronger)
+PENALTY_SHIFT_TRANSITION_W = 160.0  # weight for unrealistic day-to-day shift changes
 MONTH_OBJECTIVE_WEIGHT = 0.07    # weight for monthly fairness term
 
 random.seed(SEED)
@@ -242,6 +244,32 @@ def work_streak_penalty_cycle_any_shift(cyc: List[List[str]]) -> float:
     return penalty / 2.0
 
 
+def shift_transition_penalty_cycle(cyc: List[List[str]]) -> float:
+    """Penalty when a group changes to a different shift without the required rest days."""
+    penalty = 0.0
+    for gi, _ in enumerate(GROUPS):
+        for d in range(CYCLE_LEN):
+            current = cyc[d][gi]
+            if current not in SHIFTS:
+                continue
+
+            # scan forward until we encounter the next working day or looped once around the cycle
+            rest_days = 0
+            steps = 0
+            idx = (d + 1) % CYCLE_LEN
+            while steps < CYCLE_LEN:
+                nxt = cyc[idx][gi]
+                if nxt == HOLIDAY:
+                    rest_days += 1
+                else:
+                    if nxt != current and rest_days < MIN_REST_DAYS_BETWEEN_SHIFTS:
+                        penalty += 1.0
+                    break
+                idx = (idx + 1) % CYCLE_LEN
+                steps += 1
+    return penalty
+
+
 def day_feasibility_penalty_cycle(cyc: List[List[str]]) -> float:
     p = 0.0
     for d in range(CYCLE_LEN):
@@ -259,6 +287,7 @@ def fitness_cycle(cyc: List[List[str]], months: List[str], month_list: List[str]
     p_day = day_feasibility_penalty_cycle(cyc)
     p_run_same = runlength_penalty_cycle_same_shift(cyc) * PENALTY_SHIFT_RUN_W
     p_work_streak = work_streak_penalty_cycle_any_shift(cyc) * PENALTY_WORK_STREAK_W
+    p_shift_trans = shift_transition_penalty_cycle(cyc) * PENALTY_SHIFT_TRANSITION_W
 
     # if infeasible, these penalties will dominate and GA will move away
     sched = tile_cycle(cyc)
@@ -276,13 +305,21 @@ def fitness_cycle(cyc: List[List[str]], months: List[str], month_list: List[str]
         for g in GROUPS:
             fairness_month += (work_m[g][m] - Tm[m]) ** 2
 
-    f = fairness_year + MONTH_OBJECTIVE_WEIGHT * fairness_month + p_day + p_run_same + p_work_streak
+    f = (
+        fairness_year
+        + MONTH_OBJECTIVE_WEIGHT * fairness_month
+        + p_day
+        + p_run_same
+        + p_work_streak
+        + p_shift_trans
+    )
     meta = {
         "fairness_year": fairness_year,
         "fairness_month": fairness_month,
         "day_pen": p_day,
         "run_pen_same": p_run_same,
         "work_streak_pen": p_work_streak,
+        "shift_transition_pen": p_shift_trans,
         "counts_year": counts_y
     }
     return f, meta
@@ -391,10 +428,32 @@ def run_ga_cycle():
             print(
                 f"Gen {gen+1:4d} | best_f={best_f:.2f} | year={yr:.2f} | monthW*={MONTH_OBJECTIVE_WEIGHT*mo:.2f} "
                 f"| run_same_pen={best_meta['run_pen_same']:.2f} | work_streak_pen={best_meta['work_streak_pen']:.2f} "
-                f"| day_pen={best_meta['day_pen']:.2f} | MeanAvgPerMonth={mean_avg:.2f} | CYCLE_LEN={CYCLE_LEN}"
+                f"| shift_change_pen={best_meta['shift_transition_pen']:.2f} | day_pen={best_meta['day_pen']:.2f} "
+                f"| MeanAvgPerMonth={mean_avg:.2f} | CYCLE_LEN={CYCLE_LEN}"
             )
 
     return best_ind, best_meta
+
+
+def cycle_to_shift_table(cyc: List[List[str]]) -> Dict[str, List[str]]:
+    table = {s: [] for s in SHIFTS}
+    table[HOLIDAY] = []
+    for d in range(CYCLE_LEN):
+        shift_assignment = {s: '-' for s in SHIFTS}
+        holiday_groups = []
+        for gi, g in enumerate(GROUPS):
+            val = cyc[d][gi]
+            if val == HOLIDAY:
+                holiday_groups.append(g)
+            elif val in SHIFTS:
+                if shift_assignment[val] == '-':
+                    shift_assignment[val] = g
+                else:
+                    shift_assignment[val] += f"/{g}"
+        for s in SHIFTS:
+            table[s].append(shift_assignment[s])
+        table[HOLIDAY].append(",".join(holiday_groups) if holiday_groups else '-')
+    return table
 
 
 def summarize_cycle(cyc, meta):
@@ -408,16 +467,21 @@ def summarize_cycle(cyc, meta):
     print(f"Month fairness(weighted): {MONTH_OBJECTIVE_WEIGHT*meta['fairness_month']:.2f}")
     print(f"Run same-shift penalty: {meta['run_pen_same']:.2f}")
     print(f"Work-streak (> {MAX_WORK_STREAK}) penalty: {meta['work_streak_pen']:.2f}")
+    print(f"Shift change penalty: {meta['shift_transition_pen']:.2f}")
     print(f"Day feasibility penalty: {meta['day_pen']:.2f}")
     mean_avg = mean_avg_per_month_from_counts(meta["counts_year"])
     print(f"\nMean Average Work Days per Month (across groups): {mean_avg:.2f}")
 
     # Preview first 14 days of the cycle
-    print("\nFirst cycle block preview:")
-    header = "Day  " + "  ".join(GROUPS)
-    print(header)
-    for d in range(min(CYCLE_LEN, 14)):
-        print(f"{d+1:>3}  " + "  ".join(cyc[d]))
+    print("\nCycle pattern (group per shift each day):")
+    table = cycle_to_shift_table(cyc)
+    day_labels = [f"{d+1:>3}" for d in range(CYCLE_LEN)]
+    header = ["Shift"] + day_labels
+    col_width = max(5, max(len(g) for row in table.values() for g in row))
+    print(" ".join(h.rjust(col_width) for h in header))
+    for shift_name in SHIFTS + [HOLIDAY]:
+        row = [shift_name] + table[shift_name]
+        print(" ".join(cell.rjust(col_width) for cell in row))
 
 
 if __name__ == "__main__":
