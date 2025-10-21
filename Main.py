@@ -72,7 +72,18 @@ CEAHA_GUIDED_NOISE_STD = 1.0
 CEAHA_TERRITORIAL_NOISE_STD = 0.35
 
 # Algorithms to run when executing as a script (order preserved)
-DEFAULT_ALGORITHMS = ("GA", "CEAHA")
+# Toggle the booleans below to enable/disable each algorithm without editing
+# the entry-point logic further down.
+RUN_GA = True
+RUN_CEAHA = True
+
+# Derived list of algorithms that should execute when the module is run as a
+# script. Order is preserved so plots and summaries are consistent.
+DEFAULT_ALGORITHMS = tuple(
+    name
+    for name, enabled in (("GA", RUN_GA), ("CEAHA", RUN_CEAHA))
+    if enabled
+)
 
 # Objective/penalty weights
 PENALTY_SHIFT_RUN_W = 80.0       # weight for SAME-shift run-length violations
@@ -985,6 +996,8 @@ def summarize_cycle(cyc, meta):
 
 
 if __name__ == "__main__":
+    if not DEFAULT_ALGORITHMS:
+        print("No algorithms are enabled. Set RUN_GA or RUN_CEAHA to True to execute a solver.")
     history_by_algo: Dict[str, List[float]] = {}
 
     for algo in DEFAULT_ALGORITHMS:
