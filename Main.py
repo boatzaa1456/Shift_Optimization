@@ -32,6 +32,7 @@ NUM_GROUPS = 3
 GROUPS = [chr(ord('A') + i) for i in range(NUM_GROUPS)]   # ['A','B','C','D','E','F']
 SHIFTS = ['M', 'N']                                # any set, e.g. ['M','N'] or ['D','A','N']
 HOLIDAY = 'H'
+GROUP_INDEX = {g: idx for idx, g in enumerate(GROUPS)}
 
 # Cycle length pattern: keep a repeating weekly/bi-weekly template
 CYCLE_LEN = 14                                     # choose 7 or 14 for realistic repeating pattern
@@ -42,19 +43,22 @@ MAX_WORK_STREAK = 6      # NEW RULE: max consecutive working days (any shift)
 MIN_REST_DAYS_BETWEEN_SHIFTS = 1  # require at least this many holidays before changing shift type
 
 # GA hyper-parameters
-POP_SIZE = 480
-GENERATIONS = 3000
+POP_SIZE = 320
+GENERATIONS = 1500
 TOURNAMENT_K = 3
 CROSSOVER_RATE = 0.9
-MUTATION_RATE = 0.35         # per-cycle-day mutation probability
+MUTATION_RATE_BASE = 0.3      # baseline per-cycle-day mutation probability
+MUTATION_RATE_MAX = 0.55      # adaptive ceiling when exploration is needed
 ELITE_KEEP = 2
 IMMIGRANTS_FRAC = 0.10       # % random immigrants each generation
+NO_IMPROVE_RESET = 200       # generations without progress before re-diversifying
 
 # Objective/penalty weights
 PENALTY_SHIFT_RUN_W = 80.0       # weight for SAME-shift run-length violations
 PENALTY_WORK_STREAK_W = 120.0    # weight for > MAX_WORK_STREAK violations (stronger)
 PENALTY_SHIFT_TRANSITION_W = 160.0  # weight for unrealistic day-to-day shift changes
-MONTH_OBJECTIVE_WEIGHT = 0.07    # weight for monthly fairness term
+YEAR_FAIRNESS_WEIGHT = 0.05
+MONTH_OBJECTIVE_WEIGHT = 0.01    # quadratic monthly fairness guardrail
 
 random.seed(SEED)
 
@@ -73,6 +77,17 @@ def make_calendar():
             seen.add(m)
     month_days = {m: months.count(m) for m in month_list}
     return days, months, month_list, month_days
+
+
+def precompute_cycle_coverage(months: List[str], month_list: List[str]) -> Tuple[List[int], List[Dict[str, int]]]:
+    """Pre-compute how often each cycle index appears in the year and per-month."""
+    year_freq = [0 for _ in range(CYCLE_LEN)]
+    month_freq = [{m: 0 for m in month_list} for _ in range(CYCLE_LEN)]
+    for day_idx, month in enumerate(months):
+        cyc_idx = day_idx % CYCLE_LEN
+        year_freq[cyc_idx] += 1
+        month_freq[cyc_idx][month] += 1
+    return year_freq, month_freq
 
 
 # ==============
@@ -104,6 +119,81 @@ def mean_avg_per_month_from_counts(counts_year: dict) -> float:
     return (sum(counts_year.values()) / float(len(counts_year))) / 12.0
 
 
+def mean_avg_per_month_gap(work_m: Dict[str, Dict[str, int]], month_list: List[str], target_month: Dict[str, float]) -> float:
+    """Average absolute deviation from the ideal workdays per month across groups."""
+    total = 0.0
+    count = 0
+    for g in GROUPS:
+        for m in month_list:
+            total += abs(work_m[g][m] - target_month[m])
+            count += 1
+    return total / float(count if count else 1)
+
+
+def compute_month_counts_for_cycle(cyc: List[List[str]], month_freq: List[Dict[str, int]], month_list: List[str]) -> Dict[str, Dict[str, int]]:
+    counts = {g: {m: 0 for m in month_list} for g in GROUPS}
+    for cyc_idx in range(CYCLE_LEN):
+        month_counts = month_freq[cyc_idx]
+        row = cyc[cyc_idx]
+        for gi, g in enumerate(GROUPS):
+            if row[gi] in SHIFTS:
+                for m, mc in month_counts.items():
+                    if mc:
+                        counts[g][m] += mc
+    return counts
+
+
+def balance_cycle_monthly(
+    cyc: List[List[str]],
+    month_freq: List[Dict[str, int]],
+    month_list: List[str],
+    target_month: Dict[str, float],
+    attempts: int = 3,
+) -> None:
+    """Heuristic post-mutation adjuster to reduce large monthly imbalances."""
+    for _ in range(attempts):
+        work_m = compute_month_counts_for_cycle(cyc, month_freq, month_list)
+        # locate the largest surplus and deficit
+        max_diff = (0.0, None, None)
+        min_diff = (0.0, None, None)
+        for g in GROUPS:
+            for m in month_list:
+                diff = work_m[g][m] - target_month[m]
+                if diff > max_diff[0]:
+                    max_diff = (diff, g, m)
+                if diff < min_diff[0]:
+                    min_diff = (diff, g, m)
+
+        if max_diff[1] is None or min_diff[1] is None or max_diff[0] <= 0 or min_diff[0] >= 0:
+            break
+
+        surplus_group, surplus_month = max_diff[1], max_diff[2]
+        deficit_group, _ = min_diff[1], min_diff[2]
+        gi_surplus = GROUP_INDEX[surplus_group]
+        gi_deficit = GROUP_INDEX[deficit_group]
+
+        candidate_days = [d for d in range(CYCLE_LEN) if month_freq[d][surplus_month] > 0]
+        random.shuffle(candidate_days)
+        improved = False
+        for d in candidate_days:
+            row = cyc[d]
+            val_surplus = row[gi_surplus]
+            if val_surplus not in SHIFTS:
+                continue
+            val_deficit = row[gi_deficit]
+            if val_deficit == HOLIDAY:
+                row[gi_deficit] = val_surplus
+                row[gi_surplus] = HOLIDAY
+                repair_day_row(row)
+                improved = True
+                break
+            elif val_deficit in SHIFTS and val_deficit != val_surplus:
+                row[gi_surplus], row[gi_deficit] = val_deficit, val_surplus
+                repair_day_row(row)
+                improved = True
+                break
+        if not improved:
+            break
 def make_empty_cycle() -> List[List[str]]:
     return [[HOLIDAY for _ in GROUPS] for _ in range(CYCLE_LEN)]
 
@@ -279,7 +369,14 @@ def day_feasibility_penalty_cycle(cyc: List[List[str]]) -> float:
     return p
 
 
-def fitness_cycle(cyc: List[List[str]], months: List[str], month_list: List[str], month_days: Dict[str, int]) -> Tuple[float, Dict]:
+def fitness_cycle(
+    cyc: List[List[str]],
+    year_freq: List[int],
+    month_freq: List[Dict[str, int]],
+    month_list: List[str],
+    target_year_value: float,
+    target_month: Dict[str, float],
+) -> Tuple[float, Dict]:
     """
     Compute fitness on the *tiled* 365-day schedule produced by the cycle.
     """
@@ -290,23 +387,38 @@ def fitness_cycle(cyc: List[List[str]], months: List[str], month_list: List[str]
     p_shift_trans = shift_transition_penalty_cycle(cyc) * PENALTY_SHIFT_TRANSITION_W
 
     # if infeasible, these penalties will dominate and GA will move away
-    sched = tile_cycle(cyc)
+    counts_y = {g: 0 for g in GROUPS}
+    work_m = {g: {m: 0 for m in month_list} for g in GROUPS}
 
-    # yearly fairness
-    counts_y = work_counts_year(sched)
-    T_year = target_year()
-    fairness_year = sum((counts_y[g] - T_year) ** 2 for g in GROUPS)
+    for cyc_idx in range(CYCLE_LEN):
+        freq_year = year_freq[cyc_idx]
+        if not freq_year:
+            continue
+        row = cyc[cyc_idx]
+        month_counts = month_freq[cyc_idx]
+        for gi, g in enumerate(GROUPS):
+            if row[gi] in SHIFTS:
+                counts_y[g] += freq_year
+                for m, mc in month_counts.items():
+                    if mc:
+                        work_m[g][m] += mc
 
-    # monthly fairness
-    work_m = work_counts_monthly(sched, months, month_list)
-    Tm = target_months(month_days)
+    fairness_year = sum((counts_y[g] - target_year_value) ** 2 for g in GROUPS)
     fairness_month = 0.0
     for m in month_list:
+        ideal_m = target_month[m]
         for g in GROUPS:
-            fairness_month += (work_m[g][m] - Tm[m]) ** 2
+            fairness_month += (work_m[g][m] - ideal_m) ** 2
+
+    mean_avg_gap = mean_avg_per_month_gap(work_m, month_list, target_month)
+    mean_avg_workdays = mean_avg_per_month_from_counts(counts_y)
+
+    # fitness emphasises the monthly gap first, with softer fairness + feasibility penalties
+    year_abs_gap = sum(abs(counts_y[g] - target_year_value) for g in GROUPS) / float(NUM_GROUPS)
 
     f = (
-        fairness_year
+        mean_avg_gap
+        + YEAR_FAIRNESS_WEIGHT * year_abs_gap
         + MONTH_OBJECTIVE_WEIGHT * fairness_month
         + p_day
         + p_run_same
@@ -320,7 +432,11 @@ def fitness_cycle(cyc: List[List[str]], months: List[str], month_list: List[str]
         "run_pen_same": p_run_same,
         "work_streak_pen": p_work_streak,
         "shift_transition_pen": p_shift_trans,
-        "counts_year": counts_y
+        "counts_year": counts_y,
+        "work_month": work_m,
+        "mean_avg_gap": mean_avg_gap,
+        "mean_avg_workdays": mean_avg_workdays,
+        "year_abs_gap": year_abs_gap,
     }
     return f, meta
 
@@ -340,10 +456,10 @@ def crossover_cycle(p1: List[List[str]], p2: List[List[str]]) -> Tuple[List[List
     return c1, c2
 
 
-def mutate_cycle(indiv: List[List[str]]) -> None:
+def mutate_cycle(indiv: List[List[str]], mutation_rate: float) -> None:
     # day-wise local mutation
     for d in range(CYCLE_LEN):
-        if random.random() < MUTATION_RATE:
+        if random.random() < mutation_rate:
             chosen = random.sample(range(NUM_GROUPS), len(SHIFTS))
             random.shuffle(chosen)
             for gi in range(NUM_GROUPS):
@@ -376,26 +492,50 @@ def tournament_select(pop, fits):
 def run_ga_cycle():
     assert_params()
     _, months, month_list, month_days = make_calendar()
+    year_freq, month_freq = precompute_cycle_coverage(months, month_list)
+    target_year_value = target_year()
+    target_month = target_months(month_days)
 
     # init population
     population = [init_random_cycle() for _ in range(POP_SIZE)]
     fit_cache = [None] * POP_SIZE
+    mutation_rate = MUTATION_RATE_BASE
 
     def eval_pop():
         for i in range(POP_SIZE):
             if fit_cache[i] is None:
-                fit_cache[i] = fitness_cycle(population[i], months, month_list, month_days)
+                fit_cache[i] = fitness_cycle(
+                    population[i],
+                    year_freq,
+                    month_freq,
+                    month_list,
+                    target_year_value,
+                    target_month,
+                )
 
     best_f = float('inf'); best_ind = None; best_meta = None
+    no_improve = 0
 
     for gen in range(GENERATIONS):
         eval_pop()
         fits = [fit_cache[i][0] for i in range(POP_SIZE)]
 
         # track best
+        improved_this_gen = False
         for i in range(POP_SIZE):
             if fits[i] < best_f:
-                best_f = fits[i]; best_ind = copy_cycle(population[i]); best_meta = fit_cache[i][1]
+                best_f = fits[i]
+                best_ind = copy_cycle(population[i])
+                best_meta = fit_cache[i][1]
+                improved_this_gen = True
+
+        if improved_this_gen:
+            no_improve = 0
+            mutation_rate = max(MUTATION_RATE_BASE, mutation_rate * 0.92)
+        else:
+            no_improve += 1
+            if no_improve % 40 == 0:
+                mutation_rate = min(MUTATION_RATE_MAX, mutation_rate * 1.08)
 
         # elitism
         order = sorted(range(POP_SIZE), key=lambda i: fits[i])
@@ -407,7 +547,10 @@ def run_ga_cycle():
             p1 = tournament_select(population, fits)
             p2 = tournament_select(population, fits)
             c1, c2 = crossover_cycle(p1, p2)
-            mutate_cycle(c1); mutate_cycle(c2)
+            mutate_cycle(c1, mutation_rate)
+            mutate_cycle(c2, mutation_rate)
+            balance_cycle_monthly(c1, month_freq, month_list, target_month)
+            balance_cycle_monthly(c2, month_freq, month_list, target_month)
             new_pop.append(c1)
             if len(new_pop) < POP_SIZE:
                 new_pop.append(c2)
@@ -417,20 +560,39 @@ def run_ga_cycle():
         for k in range(num_imm):
             new_pop[-1 - k] = init_random_cycle()
 
+        if no_improve >= NO_IMPROVE_RESET:
+            # forcefully diversify by refreshing half of the non-elite population
+            for idx in range(ELITE_KEEP, POP_SIZE):
+                if random.random() < 0.5:
+                    new_pop[idx] = init_random_cycle()
+            mutation_rate = min(MUTATION_RATE_MAX, mutation_rate * 1.15)
+            no_improve = 0
+
         population = new_pop
         fit_cache = [None] * POP_SIZE
 
         # progress log with MeanAvgPerMonth
         if (gen + 1) % 50 == 0 or gen == 0:
-            yr = best_meta["fairness_year"]
-            mo = best_meta["fairness_month"]
-            mean_avg = mean_avg_per_month_from_counts(best_meta["counts_year"])
+            yr = best_meta["fairness_year"] if best_meta else float('nan')
+            mo = best_meta["fairness_month"] if best_meta else float('nan')
+            mean_avg_gap = best_meta["mean_avg_gap"] if best_meta else float('nan')
+            mean_avg = best_meta["mean_avg_workdays"] if best_meta else float('nan')
+            year_abs_gap = best_meta["year_abs_gap"] if best_meta else float('nan')
             print(
-                f"Gen {gen+1:4d} | best_f={best_f:.2f} | year={yr:.2f} | monthW*={MONTH_OBJECTIVE_WEIGHT*mo:.2f} "
+                f"Gen {gen+1:4d} | best_f={best_f:.4f} | MeanAvgPerMonthGap={mean_avg_gap:.4f} "
+                f"| meanWorkMonth={mean_avg:.2f} | year_sq={yr:.2f} | year_abs={year_abs_gap:.2f} "
+                f"| monthW*={MONTH_OBJECTIVE_WEIGHT*mo:.2f} "
                 f"| run_same_pen={best_meta['run_pen_same']:.2f} | work_streak_pen={best_meta['work_streak_pen']:.2f} "
                 f"| shift_change_pen={best_meta['shift_transition_pen']:.2f} | day_pen={best_meta['day_pen']:.2f} "
-                f"| MeanAvgPerMonth={mean_avg:.2f} | CYCLE_LEN={CYCLE_LEN}"
+                f"| mut_rate={mutation_rate:.2f} | CYCLE_LEN={CYCLE_LEN}"
             )
+
+        if best_meta and best_meta["mean_avg_gap"] <= 0.01 and best_meta["year_abs_gap"] <= 0.5:
+            print(
+                f"Early stop at generation {gen+1}: MeanAvgPerMonthGap={best_meta['mean_avg_gap']:.4f}, "
+                f"year_abs_gap={best_meta['year_abs_gap']:.2f}"
+            )
+            break
 
     return best_ind, best_meta
 
@@ -469,8 +631,14 @@ def summarize_cycle(cyc, meta):
     print(f"Work-streak (> {MAX_WORK_STREAK}) penalty: {meta['work_streak_pen']:.2f}")
     print(f"Shift change penalty: {meta['shift_transition_pen']:.2f}")
     print(f"Day feasibility penalty: {meta['day_pen']:.2f}")
-    mean_avg = mean_avg_per_month_from_counts(meta["counts_year"])
+    mean_avg = meta.get("mean_avg_workdays", mean_avg_per_month_from_counts(meta["counts_year"]))
+    mean_gap = meta.get("mean_avg_gap")
+    year_abs = meta.get("year_abs_gap")
     print(f"\nMean Average Work Days per Month (across groups): {mean_avg:.2f}")
+    if mean_gap is not None:
+        print(f"MeanAvgPerMonthGap (objective): {mean_gap:.4f}")
+    if year_abs is not None:
+        print(f"Yearly average absolute gap: {year_abs:.2f}")
 
     # Preview first 14 days of the cycle
     print("\nCycle pattern (group per shift each day):")
