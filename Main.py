@@ -15,10 +15,11 @@ Cycle-based Genetic Algorithm for Shift Scheduling
 Copy–paste to PyCharm and run.
 """
 
+import math
 import random
 from collections import Counter
 from datetime import date, timedelta
-from typing import List, Tuple, Dict
+from typing import Callable, Dict, List, Optional, Tuple
 
 # ==============
 # CONFIG
@@ -33,6 +34,8 @@ GROUPS = [chr(ord('A') + i) for i in range(NUM_GROUPS)]   # ['A','B','C','D','E'
 SHIFTS = ['M', 'N']                                # any set, e.g. ['M','N'] or ['D','A','N']
 HOLIDAY = 'H'
 GROUP_INDEX = {g: idx for idx, g in enumerate(GROUPS)}
+SHIFT_CHOICES = SHIFTS + [HOLIDAY]
+SHIFT_TO_IDX = {name: idx for idx, name in enumerate(SHIFT_CHOICES)}
 
 # Cycle length pattern: keep a repeating weekly/bi-weekly template
 CYCLE_LEN = 14                                     # choose 7 or 14 for realistic repeating pattern
@@ -52,6 +55,19 @@ MUTATION_RATE_MAX = 0.55      # adaptive ceiling when exploration is needed
 ELITE_KEEP = 2
 IMMIGRANTS_FRAC = 0.10       # % random immigrants each generation
 NO_IMPROVE_RESET = 200       # generations without progress before re-diversifying
+
+# CEAHA (Chaotic Enhanced Artificial Hummingbird Algorithm) hyper-parameters
+CEAHA_POP_SIZE = 120
+CEAHA_ITERATIONS = 600
+CEAHA_MAP_INIT = 'tent'
+CEAHA_MAP_FLIGHT = 'logistic'
+CEAHA_SEED_INIT = 0.3871
+CEAHA_SEED_FLIGHT = 0.7123
+CEAHA_GUIDED_NOISE_STD = 1.0
+CEAHA_TERRITORIAL_NOISE_STD = 0.35
+
+# Algorithms to run when executing as a script (order preserved)
+DEFAULT_ALGORITHMS = ("GA", "CEAHA")
 
 # Objective/penalty weights
 PENALTY_SHIFT_RUN_W = 80.0       # weight for SAME-shift run-length violations
@@ -194,6 +210,156 @@ def balance_cycle_monthly(
                 break
         if not improved:
             break
+
+
+# ==============
+# VECTOR ENCODING HELPERS
+# ==============
+
+def _seed_to_unit(seed: float) -> float:
+    try:
+        value = float(seed)
+    except (TypeError, ValueError):
+        value = float(abs(hash(seed)) % 10_000) / 10_000.0
+    frac = value - math.floor(value)
+    if frac <= 0.0:
+        frac = (abs(value) % 1.0) or 0.5
+    return min(max(frac, 1e-9), 1.0 - 1e-9)
+
+
+def chaotic_map_generator(map_name: str, seed: float) -> Callable[[], float]:
+    """Return a generator yielding chaotic numbers in (0,1)."""
+
+    name = (map_name or 'logistic').lower()
+    state = _seed_to_unit(seed)
+
+    def logistic(x: float) -> float:
+        return 4.0 * x * (1.0 - x)
+
+    def tent(x: float) -> float:
+        return 2.0 * x if x < 0.5 else 2.0 * (1.0 - x)
+
+    def sine(x: float) -> float:
+        return math.sin(math.pi * x)
+
+    def chebyshev(x: float) -> float:
+        # Map through Chebyshev map and re-scale to (0,1)
+        val = math.cos(2.0 * math.acos(min(0.999999, max(-0.999999, 2.0 * x - 1.0))))
+        return (val + 1.0) * 0.5
+
+    map_funcs = {
+        'tent': tent,
+        'logistic': logistic,
+        'sine': sine,
+        'chebyshev': chebyshev,
+    }
+
+    iterate = map_funcs.get(name, logistic)
+
+    def generator() -> float:
+        nonlocal state
+        nxt = iterate(state)
+        if not (0.0 < nxt < 1.0):
+            nxt = _seed_to_unit(nxt + 0.123456789)
+        state = min(max(nxt, 1e-9), 1.0 - 1e-9)
+        return state
+
+    return generator
+
+
+def clip_round_vector(vec: List[float], lb: float, ub: float) -> List[float]:
+    return [float(round(min(ub, max(lb, v)))) for v in vec]
+
+
+def vector_to_cycle(vec: List[float]) -> List[List[str]]:
+    cyc = [[HOLIDAY for _ in GROUPS] for _ in range(CYCLE_LEN)]
+    max_idx = len(SHIFT_CHOICES) - 1
+    for pos, value in enumerate(vec):
+        day = pos // NUM_GROUPS
+        gi = pos % NUM_GROUPS
+        idx = int(round(min(max(value, 0.0), max_idx)))
+        cyc[day][gi] = SHIFT_CHOICES[idx]
+    for d in range(CYCLE_LEN):
+        repair_day_row(cyc[d])
+    return cyc
+
+
+def cycle_to_vector(cyc: List[List[str]]) -> List[float]:
+    return [float(SHIFT_TO_IDX[cyc[d][gi]]) for d in range(CYCLE_LEN) for gi in range(NUM_GROUPS)]
+
+
+def sample_flight_skill_vector(d: int) -> List[float]:
+    choice = random.choice(('axial', 'diagonal', 'omni'))
+    vec = [0.0] * d
+    if choice == 'axial' or d == 1:
+        idx = random.randrange(d)
+        vec[idx] = 1.0
+    elif choice == 'diagonal':
+        count = min(d, random.randint(2, max(2, min(4, d))))
+        for idx in random.sample(range(d), count):
+            vec[idx] = 1.0
+    else:
+        for i in range(d):
+            vec[i] = 1.0
+    return vec
+
+
+def elementwise_add(a: List[float], b: List[float]) -> List[float]:
+    return [x + y for x, y in zip(a, b)]
+
+
+def elementwise_sub(a: List[float], b: List[float]) -> List[float]:
+    return [x - y for x, y in zip(a, b)]
+
+
+def elementwise_mul(a: List[float], b: List[float]) -> List[float]:
+    return [x * y for x, y in zip(a, b)]
+
+
+def init_visit_table(n: int) -> List[List[Optional[int]]]:
+    table: List[List[Optional[int]]] = []
+    for i in range(n):
+        row: List[Optional[int]] = []
+        for j in range(n):
+            if i == j:
+                row.append(None)
+            else:
+                row.append(0)
+        table.append(row)
+    return table
+
+
+def argmax_visit_row(V: List[List[Optional[int]]], i: int) -> int:
+    row = V[i]
+    best_val: Optional[int] = None
+    best_indices: List[int] = []
+    for j, val in enumerate(row):
+        if j == i or val is None:
+            continue
+        if best_val is None or val > best_val:
+            best_val = val
+            best_indices = [j]
+        elif val == best_val:
+            best_indices.append(j)
+    if best_indices:
+        return random.choice(best_indices)
+    candidates = [j for j in range(len(row)) if j != i]
+    return random.choice(candidates)
+
+
+def visit_row_max(row: List[Optional[int]], skip_index: int) -> int:
+    values = [val for idx, val in enumerate(row) if idx != skip_index and val is not None]
+    if not values:
+        return 0
+    return max(values)
+
+
+def increment_visit_levels(row: List[Optional[int]], skip_index: int) -> None:
+    for idx, val in enumerate(row):
+        if idx == skip_index or val is None:
+            continue
+        row[idx] = (val or 0) + 1
+
 def make_empty_cycle() -> List[List[str]]:
     return [[HOLIDAY for _ in GROUPS] for _ in range(CYCLE_LEN)]
 
@@ -597,6 +763,160 @@ def run_ga_cycle():
     return best_ind, best_meta
 
 
+def run_ceaha_cycle(
+    pop_size: int = CEAHA_POP_SIZE,
+    iterations: int = CEAHA_ITERATIONS,
+    map_init: str = CEAHA_MAP_INIT,
+    map_flight: str = CEAHA_MAP_FLIGHT,
+    seed_init: float = CEAHA_SEED_INIT,
+    seed_flight: float = CEAHA_SEED_FLIGHT,
+) -> Tuple[List[List[str]], Dict]:
+    """Run the Chaotic Enhanced Artificial Hummingbird Algorithm on the cycle."""
+
+    assert_params()
+    _, months, month_list, month_days = make_calendar()
+    year_freq, month_freq = precompute_cycle_coverage(months, month_list)
+    target_year_value = target_year()
+    target_month = target_months(month_days)
+
+    dimension = CYCLE_LEN * NUM_GROUPS
+    lb = 0.0
+    ub = float(len(SHIFT_CHOICES) - 1)
+
+    gen_init = chaotic_map_generator(map_init, seed_init)
+
+    def evaluate(vec: List[float]) -> Tuple[float, Dict, List[List[str]], List[float]]:
+        projected = clip_round_vector(vec, lb, ub)
+        cyc = vector_to_cycle(projected)
+        vec_store = cycle_to_vector(cyc)
+        fit, meta = fitness_cycle(
+            cyc,
+            year_freq,
+            month_freq,
+            month_list,
+            target_year_value,
+            target_month,
+        )
+        return fit, meta, cyc, vec_store
+
+    population: List[List[float]] = []
+    cycles: List[List[List[str]]] = []
+    metas: List[Dict] = []
+    fitness_values: List[float] = []
+    visit = init_visit_table(pop_size)
+
+    for _ in range(pop_size):
+        candidate = [lb + gen_init() * (ub - lb) for _ in range(dimension)]
+        f_val, meta, cyc, vec_store = evaluate(candidate)
+        population.append(vec_store)
+        cycles.append(cyc)
+        metas.append(meta)
+        fitness_values.append(f_val)
+
+    best_idx = min(range(pop_size), key=lambda idx: fitness_values[idx])
+    best_fit = fitness_values[best_idx]
+    best_cycle = [row[:] for row in cycles[best_idx]]
+    best_meta = metas[best_idx]
+
+    def update_best(i: int) -> None:
+        nonlocal best_idx, best_fit, best_cycle, best_meta
+        if fitness_values[i] < best_fit:
+            best_idx = i
+            best_fit = fitness_values[i]
+            best_cycle = [row[:] for row in cycles[i]]
+            best_meta = metas[i]
+
+    for t in range(1, iterations + 1):
+        gen_flight = chaotic_map_generator(map_flight, seed_flight + t)
+
+        # Phase A: Chaotic Traversal Flight
+        for i in range(pop_size):
+            Dt = sample_flight_skill_vector(dimension)
+            H = [gen_flight() for _ in range(dimension)]
+            scale_den = pop_size - 2 + 2.0 * random.random()
+            scale = (ub - lb) / scale_den if scale_den else (ub - lb)
+            step = elementwise_mul(H, [scale] * dimension)
+            base = [val + 0.5 for val in population[i]]
+            offset = elementwise_mul(step, elementwise_mul(Dt, base))
+            trial_vec = elementwise_add(population[i], offset)
+            f_val, meta, cyc, vec_store = evaluate(trial_vec)
+            if f_val < fitness_values[i]:
+                population[i] = vec_store
+                cycles[i] = cyc
+                metas[i] = meta
+                fitness_values[i] = f_val
+                target_j = argmax_visit_row(visit, i)
+                visit[i][target_j] = visit_row_max(visit[i], i) + 1
+                update_best(i)
+            else:
+                increment_visit_levels(visit[i], i)
+
+        # Phase B: Guided Foraging
+        for i in range(pop_size):
+            j = argmax_visit_row(visit, i)
+            Dt = sample_flight_skill_vector(dimension)
+            alpha = random.gauss(0.0, CEAHA_GUIDED_NOISE_STD)
+            direction = elementwise_mul(Dt, elementwise_sub(population[i], population[j]))
+            if not any(abs(val) > 1e-9 for val in direction):
+                chaos_dir = [random.random() - 0.5 for _ in range(dimension)]
+                direction = elementwise_mul(Dt, chaos_dir)
+            perturb = [alpha * val for val in direction]
+            trial_vec = elementwise_add(population[j], perturb)
+            f_val, meta, cyc, vec_store = evaluate(trial_vec)
+            if f_val < fitness_values[i]:
+                population[i] = vec_store
+                cycles[i] = cyc
+                metas[i] = meta
+                fitness_values[i] = f_val
+                visit[i][j] = visit_row_max(visit[i], i) + 1
+                update_best(i)
+            else:
+                increment_visit_levels(visit[i], i)
+
+        # Phase C: Territorial Foraging
+        for i in range(pop_size):
+            Dt = sample_flight_skill_vector(dimension)
+            b = random.gauss(0.0, CEAHA_TERRITORIAL_NOISE_STD)
+            local = elementwise_mul(Dt, [val + 0.5 for val in population[i]])
+            perturb = [b * val for val in local]
+            trial_vec = elementwise_add(population[i], perturb)
+            f_val, meta, cyc, vec_store = evaluate(trial_vec)
+            if f_val < fitness_values[i]:
+                population[i] = vec_store
+                cycles[i] = cyc
+                metas[i] = meta
+                fitness_values[i] = f_val
+                update_best(i)
+
+        # Phase D: Migratory Foraging
+        if (t % (2 * pop_size)) == 0:
+            worst_idx = max(range(pop_size), key=lambda idx: fitness_values[idx])
+            migrant = [lb + gen_init() * (ub - lb) for _ in range(dimension)]
+            f_val, meta, cyc, vec_store = evaluate(migrant)
+            population[worst_idx] = vec_store
+            cycles[worst_idx] = cyc
+            metas[worst_idx] = meta
+            fitness_values[worst_idx] = f_val
+            for m in range(pop_size):
+                if m == worst_idx:
+                    continue
+                if visit[worst_idx][m] is not None:
+                    visit[worst_idx][m] = 0
+                if visit[m][worst_idx] is not None:
+                    visit[m][worst_idx] = 0
+            update_best(worst_idx)
+
+        if t == 1 or t % 50 == 0:
+            mean_avg_gap = best_meta.get('mean_avg_gap', float('nan')) if best_meta else float('nan')
+            year_abs_gap = best_meta.get('year_abs_gap', float('nan')) if best_meta else float('nan')
+            print(
+                f"CEAHA iter {t:4d} | best_f={best_fit:.4f} | MeanAvgPerMonthGap={mean_avg_gap:.4f} "
+                f"| year_abs={year_abs_gap:.2f} | map={map_flight}"
+            )
+
+    return best_cycle, best_meta
+
+
 def cycle_to_shift_table(cyc: List[List[str]]) -> Dict[str, List[str]]:
     table = {s: [] for s in SHIFTS}
     table[HOLIDAY] = []
@@ -653,5 +973,13 @@ def summarize_cycle(cyc, meta):
 
 
 if __name__ == "__main__":
-    best_cycle, info = run_ga_cycle()
-    summarize_cycle(best_cycle, info)
+    for algo in DEFAULT_ALGORITHMS:
+        name = algo.upper()
+        print(f"\n===== Running {name} for CYCLE_LEN={CYCLE_LEN} =====")
+        if name == "GA":
+            cycle, meta = run_ga_cycle()
+        elif name == "CEAHA":
+            cycle, meta = run_ceaha_cycle()
+        else:
+            raise ValueError(f"Unsupported algorithm '{algo}'")
+        summarize_cycle(cycle, meta)
